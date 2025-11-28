@@ -128,7 +128,7 @@ if st.session_state.mqtt_client is None:
 # --------------------
 # UI
 # --------------------
-st.set_page_config(page_title="IoT ML Realtime Dashboard", layout="wide")
+# st.set_page_config(page_title="IoT ML Realtime Dashboard", layout="wide")
 st.title("IoT ML Realtime Dashboard")
 
 left, right = st.columns([1, 2])
@@ -205,4 +205,5 @@ with right:
 st.markdown("---")
 st.write("Manual override:", st.session_state.override)
 st.write("Total messages:", len(st.session_state.logs))
+
 
