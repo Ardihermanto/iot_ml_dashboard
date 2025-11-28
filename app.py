@@ -1,5 +1,7 @@
 # app.py
 import streamlit as st
+st.set_page_config(page_title="IoT ML Realtime Dashboard", layout="wide")
+
 import pandas as pd
 import numpy as np
 import joblib
@@ -203,3 +205,4 @@ with right:
 st.markdown("---")
 st.write("Manual override:", st.session_state.override)
 st.write("Total messages:", len(st.session_state.logs))
+
