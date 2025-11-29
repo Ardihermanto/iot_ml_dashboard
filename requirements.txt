@@ -1,7 +1,6 @@
 streamlit
-pandas
-numpy
+paho-mqtt
 joblib
-plotly
-asyncio-mqtt
-scikit-learn
+numpy
+pandas
+scikit-learn==1.3.2
