@@ -1,6 +1,13 @@
-# app.py — Asyncio-MQTT version for Streamlit (safe)
+# app.py
+# MQTT over WebSocket (WSS) + Streamlit safe integration
+# - Background thread runs paho-mqtt (transport="websockets")
+# - Background thread NEVER calls Streamlit APIs
+# - Two queues: mqtt_queue (inbound), publish_queue (outbound)
+# - Main Streamlit thread consumes mqtt_queue, does ML predict, updates UI,
+#   and enqueues publish messages to publish_queue.
+
 import streamlit as st
-st.set_page_config(page_title="IoT ML Realtime Dashboard (Async MQTT)", layout="wide")
+st.set_page_config(page_title="IoT ML Dashboard (WSS)", layout="wide")
 
 import pandas as pd
 import numpy as np
@@ -11,45 +18,44 @@ import threading
 import time
 from datetime import datetime
 import plotly.graph_objs as go
+import paho.mqtt.client as mqtt
+import ssl
 
-# Note: asyncio-mqtt used in background thread
-# background thread will NOT touch Streamlit APIs
-# it only puts data into mqtt_queue
-# main thread (Streamlit) will consume mqtt_queue and update UI
+# --------------------
+# CONFIG (load in main thread only)
+# --------------------
+# Default broker: broker.emqx.io supports websocket secure on port 8084 path /mqtt
+MQTT_BROKER = st.secrets.get("MQTT_BROKER", "broker.emqx.io")
+MQTT_PORT   = int(st.secrets.get("MQTT_PORT", 8084))  # wss port for EMQX
+MQTT_PATH   = st.secrets.get("MQTT_PATH", "/mqtt")   # websocket path
+TOPIC_SENSOR = st.secrets.get("TOPIC_SENSOR", "iot/class/session5/sensor")
+TOPIC_OUTPUT = st.secrets.get("TOPIC_OUTPUT", "iot/class/session5/output")
+MODEL_PATH = st.secrets.get("MODEL_PATH", "iot_temp_model.pkl")
+CLIENT_ID = st.secrets.get("CLIENT_ID", "streamlit_iot_client")
 
-# Read config in MAIN thread only (no st.* inside background thread)
-CONFIG = {
-    "MQTT_BROKER": st.secrets.get("MQTT_BROKER", "broker.hivemq.com"),
-    "MQTT_PORT": int(st.secrets.get("MQTT_PORT", 1883)),
-    "TOPIC_SENSOR": st.secrets.get("TOPIC_SENSOR", "iot/class/session5/sensor"),
-    "TOPIC_OUTPUT": st.secrets.get("TOPIC_OUTPUT", "iot/class/session5/output"),
-    "MODEL_PATH": st.secrets.get("MODEL_PATH", "iot_temp_model.pkl"),
-    "CLIENT_ID": st.secrets.get("CLIENT_ID", "streamlit_iot_client")
-}
+# --------------------
+# QUEUES (thread-safe)
+# --------------------
+mqtt_queue = queue.Queue()    # inbound messages (from broker -> main thread)
+publish_queue = queue.Queue() # outbound messages (from main thread -> broker)
 
-MQTT_BROKER = CONFIG["MQTT_BROKER"]
-MQTT_PORT = CONFIG["MQTT_PORT"]
-TOPIC_SENSOR = CONFIG["TOPIC_SENSOR"]
-TOPIC_OUTPUT = CONFIG["TOPIC_OUTPUT"]
-MODEL_PATH = CONFIG["MODEL_PATH"]
-CLIENT_ID = CONFIG["CLIENT_ID"]
-
-# thread-safe queue (producer: mqtt thread, consumer: main thread)
-mqtt_queue = queue.Queue()
-
-# Streamlit session init
+# --------------------
+# Session state init
+# --------------------
 if "logs" not in st.session_state:
     st.session_state.logs = []
 if "last" not in st.session_state:
     st.session_state.last = None
 if "override" not in st.session_state:
     st.session_state.override = None
-if "mqtt_client" not in st.session_state:
-    st.session_state.mqtt_client = None
 if "mqtt_connected" not in st.session_state:
     st.session_state.mqtt_connected = False
+if "mqtt_thread_started" not in st.session_state:
+    st.session_state.mqtt_thread_started = False
 
-# Load ML model (main thread)
+# --------------------
+# Load ML model
+# --------------------
 @st.cache_resource
 def load_model(path):
     return joblib.load(path)
@@ -60,73 +66,123 @@ except Exception as e:
     st.error(f"Failed to load model: {e}")
     st.stop()
 
-# ---------------------------
-# Background async MQTT worker
-# ---------------------------
-def mqtt_async_thread():
-    """
-    Runs an asyncio-mqtt client inside a background thread.
-    The thread NEVER calls Streamlit APIs. It only puts dict messages
-    into mqtt_queue for the main thread to consume.
-    """
-    import asyncio
-    from asyncio_mqtt import Client, MqttError
-
-    async def runner():
-        while True:
-            try:
-                async with Client(MQTT_BROKER, port=MQTT_PORT, client_id=CLIENT_ID) as client:
-                    # notify main thread about connection
-                    mqtt_queue.put({"system": "connected"})
-                    # subscribe
-                    await client.subscribe(TOPIC_SENSOR)
-                    # consume messages
-                    async with client.unfiltered_messages() as messages:
-                        async for message in messages:
-                            try:
-                                payload = message.payload.decode()
-                                data = json.loads(payload)
-                                temp = float(data.get("temp"))
-                                hum = float(data.get("hum"))
-                                ts = datetime.utcnow().isoformat()
-                                mqtt_queue.put({
-                                    "ts": ts,
-                                    "temp": temp,
-                                    "hum": hum
-                                })
-                            except Exception:
-                                # ignore bad messages
-                                continue
-            except MqttError as me:
-                # signal disconnect to main thread and retry after backoff
-                mqtt_queue.put({"system": "disconnected"})
-                await asyncio.sleep(3)
-            except Exception:
-                mqtt_queue.put({"system": "disconnected"})
-                await asyncio.sleep(3)
-
-    # Run asyncio event loop in this thread
-    try:
-        asyncio.run(runner())
-    except Exception:
-        # if thread main loop exits, signal disconnected
+# --------------------
+# MQTT callbacks (NO Streamlit calls here!)
+# --------------------
+def _on_connect(client, userdata, flags, rc):
+    # Put system status into queue (main thread will pick it)
+    if rc == 0:
+        mqtt_queue.put({"system": "connected"})
+        # subscribe
+        try:
+            client.subscribe(TOPIC_SENSOR)
+        except Exception:
+            pass
+    else:
         mqtt_queue.put({"system": "disconnected"})
 
-# start background thread once (safe — thread does NOT touch st)
-if "mqtt_thread_started" not in st.session_state:
-    t = threading.Thread(target=mqtt_async_thread, daemon=True)
-    t.start()
+def _on_message(client, userdata, msg):
+    try:
+        payload = msg.payload.decode()
+        data = json.loads(payload)
+        temp = float(data.get("temp"))
+        hum = float(data.get("hum"))
+        ts = datetime.utcnow().isoformat()
+        mqtt_queue.put({"ts": ts, "temp": temp, "hum": hum})
+    except Exception:
+        # ignore malformed messages
+        return
+
+# --------------------
+# MQTT background thread: uses websockets transport + TLS
+# --------------------
+def mqtt_background_worker():
+    """
+    Background worker that:
+    - connects via websockets (WSS) to broker
+    - subscribes to TOPIC_SENSOR
+    - pushes inbound messages to mqtt_queue
+    - pulls publish_queue and publishes messages
+    This thread MUST NOT call Streamlit APIs.
+    """
+    while True:
+        try:
+            # create client with websockets transport
+            client = mqtt.Client(client_id=CLIENT_ID, transport="websockets")
+
+            # optional: set username/password if provided in secrets (read only in main thread)
+            mqtt_user = st.secrets.get("MQTT_USER")
+            mqtt_pass = st.secrets.get("MQTT_PASS")
+            if mqtt_user and mqtt_pass:
+                client.username_pw_set(mqtt_user, mqtt_pass)
+
+            # set TLS (for wss): use system default CA certs
+            try:
+                client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLS_CLIENT)
+            except Exception:
+                # fallback: try tls_set without params
+                try:
+                    client.tls_set()
+                except Exception:
+                    pass
+
+            # set websocket path (some brokers use /mqtt)
+            try:
+                client.ws_set_options(path=MQTT_PATH)
+            except Exception:
+                pass
+
+            client.on_connect = _on_connect
+            client.on_message = _on_message
+
+            # connect (host, port)
+            client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+
+            # start network loop in separate paho thread
+            client.loop_start()
+
+            # process publish_queue non-blocking
+            while True:
+                # publish outgoing messages if any
+                try:
+                    pkt = publish_queue.get_nowait()
+                except queue.Empty:
+                    pkt = None
+
+                if pkt:
+                    tpc = pkt.get("topic")
+                    payload = pkt.get("payload")
+                    qos = pkt.get("qos", 0)
+                    retain = pkt.get("retain", False)
+                    try:
+                        client.publish(tpc, payload, qos=qos, retain=retain)
+                    except Exception:
+                        # ignore publish error; main thread can retry later
+                        pass
+
+                time.sleep(0.1)  # small sleep to yield
+        except Exception as ex:
+            # signal disconnect to main thread, wait then retry
+            try:
+                mqtt_queue.put({"system": "disconnected"})
+            except Exception:
+                pass
+            time.sleep(3)
+            continue
+
+# start background thread once
+if not st.session_state.mqtt_thread_started:
+    threading.Thread(target=mqtt_background_worker, daemon=True).start()
     st.session_state.mqtt_thread_started = True
-    # small pause to let thread attempt connect (optional)
+    # give thread a moment
     time.sleep(0.2)
 
-# ---------------------------
-# Main thread: consume queue
-# ---------------------------
-# Process all available messages in the queue (non-blocking)
+# --------------------
+# Main thread: consume mqtt_queue (safe)
+# --------------------
 while not mqtt_queue.empty():
     item = mqtt_queue.get()
-    # system messages
+    # system message (connected/disconnected)
     if "system" in item:
         st.session_state.mqtt_connected = (item["system"] == "connected")
         continue
@@ -136,51 +192,27 @@ while not mqtt_queue.empty():
     temp = item.get("temp")
     hum = item.get("hum")
 
-    # safe: prediction in main thread
+    # prediction in main thread (safe)
     try:
         pred = model.predict([[temp, hum]])[0]
-    except Exception as e:
+    except Exception:
         pred = "ERR"
 
     row = {"ts": ts, "temp": temp, "hum": hum, "pred": pred}
     st.session_state.logs.append(row)
     st.session_state.last = row
 
-    # publish back to ESP32 if mqtt client object exists (we store a small helper wrapper)
-    # Note: we do NOT call MQTT connect/publish from background thread anymore;
-    # instead we try to create a minimal publish helper using asyncio-mqtt in a short sync wrapper.
-    # For Streamlit Cloud we prefer to publish via a short synchronous attempt (best-effort).
-    try:
-        # publish using a short-lived asyncio client to send the ALERT message
-        if st.session_state.override is None:
-            # choose message
-            out_msg = "ALERT_ON" if pred == "Panas" else "ALERT_OFF"
-            # use asyncio to publish in a blocking manner (short-lived client)
-            # this keeps background thread responsibilities separate
-            import asyncio
-            from asyncio_mqtt import Client as AsyncClient
+    # enqueue automatic output to publish_queue (main->bg thread)
+    if st.session_state.override is None:
+        out_msg = "ALERT_ON" if pred == "Panas" else "ALERT_OFF"
+        publish_queue.put({"topic": TOPIC_OUTPUT, "payload": out_msg})
 
-            async def pub_once():
-                try:
-                    async with AsyncClient(MQTT_BROKER, port=MQTT_PORT) as pub_client:
-                        await pub_client.publish(TOPIC_OUTPUT, out_msg)
-                except Exception:
-                    pass
-
-            try:
-                asyncio.run(pub_once())
-            except Exception:
-                # If asyncio.run fails inside Streamlit environment, ignore publish
-                pass
-    except Exception:
-        pass
-
-# ---------------------------
+# --------------------
 # UI
-# ---------------------------
-st.title("IoT ML Realtime Dashboard — Async MQTT")
+# --------------------
+st.title("IoT ML Realtime Dashboard — WSS MQTT")
 
-left, right = st.columns([1, 2])
+left, right = st.columns([1,2])
 
 with left:
     st.subheader("Status")
@@ -191,36 +223,30 @@ with left:
     c1, c2 = st.columns(2)
     if c1.button("Force ALERT ON"):
         st.session_state.override = "ON"
-        # publish manual override message
-        try:
-            import asyncio
-            from asyncio_mqtt import Client as AsyncClient
-            async def pub_on():
-                async with AsyncClient(MQTT_BROKER, port=MQTT_PORT) as client:
-                    await client.publish(TOPIC_OUTPUT, "ALERT_ON")
-            asyncio.run(pub_on())
-        except Exception:
-            st.warning("Publish failed (best-effort).")
+        # enqueue manual publish (main -> background)
+        publish_queue.put({"topic": TOPIC_OUTPUT, "payload": "ALERT_ON"})
+        st.success("Enqueued ALERT_ON")
     if c2.button("Force ALERT OFF"):
         st.session_state.override = "OFF"
-        try:
-            import asyncio
-            from asyncio_mqtt import Client as AsyncClient
-            async def pub_off():
-                async with AsyncClient(MQTT_BROKER, port=MQTT_PORT) as client:
-                    await client.publish(TOPIC_OUTPUT, "ALERT_OFF")
-            asyncio.run(pub_off())
-        except Exception:
-            st.warning("Publish failed (best-effort).")
+        publish_queue.put({"topic": TOPIC_OUTPUT, "payload": "ALERT_OFF"})
+        st.success("Enqueued ALERT_OFF")
     if st.button("Clear Override"):
         st.session_state.override = None
-        st.success("Override cleared")
+        st.info("Auto alerts resumed")
 
     st.subheader("Last Reading")
     if st.session_state.last:
         st.write(pd.DataFrame([st.session_state.last]).T)
     else:
         st.info("No data yet")
+
+    if st.button("Save Log to CSV"):
+        if st.session_state.logs:
+            df_export = pd.DataFrame(st.session_state.logs)
+            fn = "iot_log_" + datetime.utcnow().strftime("%Y%m%d%H%M%S") + ".csv"
+            st.download_button("Download CSV", df_export.to_csv(index=False).encode("utf-8"), file_name=fn)
+        else:
+            st.warning("No logs to save")
 
 with right:
     st.subheader("Live Chart")
@@ -230,11 +256,10 @@ with right:
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df["ts"], y=df["temp"], mode="lines+markers", name="Temp (°C)"))
         fig.add_trace(go.Scatter(x=df["ts"], y=df["hum"], mode="lines+markers", name="Hum (%)"))
-        # color markers by prediction if exists
         if "pred" in df.columns:
-            colors = ["red" if p == "Panas" else "green" if p == "Normal" else "blue" for p in df["pred"]]
+            colors = ["red" if p=="Panas" else "green" if p=="Normal" else "blue" for p in df["pred"]]
             fig.update_traces(marker=dict(color=colors), selector=dict(mode="markers"))
-        fig.update_layout(xaxis_title="timestamp", height=450)
+        fig.update_layout(xaxis_title="timestamp", height=500)
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No data yet")
