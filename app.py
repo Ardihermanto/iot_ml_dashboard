@@ -1,6 +1,4 @@
 import streamlit as st
-st.set_page_config(page_title="IoT ML Dashboard", layout="wide")
-
 import json
 import time
 import pandas as pd
@@ -10,142 +8,145 @@ from datetime import datetime
 import plotly.graph_objs as go
 import paho.mqtt.client as mqtt
 
+st.set_page_config(page_title="IoT ML Dashboard", layout="wide")
 
-# -------------------------------------------------------
+# -------------------------------------------------------------------
 # CONFIG
-# -------------------------------------------------------
-BROKER = st.secrets.get("MQTT_BROKER", "broker.hivemq.com")
-PORT   = int(st.secrets.get("MQTT_PORT", "1883"))
+# -------------------------------------------------------------------
+MQTT_BROKER = st.secrets.get("MQTT_BROKER", "broker.emqx.io")
+MQTT_PORT   = int(st.secrets.get("MQTT_PORT", 1883))
 TOPIC_SENSOR = st.secrets.get("TOPIC_SENSOR", "iot/class/session5/sensor")
 TOPIC_OUTPUT = st.secrets.get("TOPIC_OUTPUT", "iot/class/session5/output")
-MODEL_PATH   = st.secrets.get("MODEL_PATH", "iot_temp_model.pkl")
+MODEL_PATH = st.secrets.get("MODEL_PATH", "iot_temp_model.pkl")
 
-# -------------------------------------------------------
-# SESSION STATE
-# -------------------------------------------------------
-if "mqtt" not in st.session_state:
-    st.session_state.mqtt = None
-
+# -------------------------------------------------------------------
+# SESSION STATE INIT
+# -------------------------------------------------------------------
 if "logs" not in st.session_state:
     st.session_state.logs = []
 
-if "last" not in st.session_state:
-    st.session_state.last = None
+if "last_data" not in st.session_state:
+    st.session_state.last_data = None
 
-# -------------------------------------------------------
+if "mqtt_client" not in st.session_state:
+    st.session_state.mqtt_client = None
+
+if "connected" not in st.session_state:
+    st.session_state.connected = False
+
+# -------------------------------------------------------------------
 # LOAD MODEL
-# -------------------------------------------------------
+# -------------------------------------------------------------------
 @st.cache_resource
 def load_model():
-    try:
-        return joblib.load(MODEL_PATH)
-    except Exception as e:
-        st.error(f"Model load error: {e}")
-        return None
+    return joblib.load(MODEL_PATH)
 
 model = load_model()
 
+# -------------------------------------------------------------------
+# INIT MQTT CLIENT
+# -------------------------------------------------------------------
+def create_client():
+    client = mqtt.Client(protocol=mqtt.MQTTv311)   # stabil untuk Streamlit Cloud
 
-# -------------------------------------------------------
-# INIT MQTT CLIENT (NO THREAD)
-# -------------------------------------------------------
-if st.session_state.mqtt is None:
-    client = mqtt.Client(protocol=mqtt.MQTTv311)
-    client.connect(BROKER, PORT, keepalive=60)
-    client.subscribe(TOPIC_SENSOR)
-    st.session_state.mqtt = client
-else:
-    client = st.session_state.mqtt
-
-
-# -------------------------------------------------------
-# POLLING FUNCTION (SAFE)
-# -------------------------------------------------------
-def poll_mqtt_message():
-    """Read exactly ONE MQTT message without blocking."""
-    try:
-        rc = client.loop(timeout=0.1)
-
-        # Map errors to safe ignore
-        if rc != mqtt.MQTT_ERR_SUCCESS:
-            return None
-
-        # Retrieve *the next message* if queued
-        msg = client._out_messages  # public queue
-        # Actually paho stores incoming messages in _in_messages
-        if hasattr(client, "_in_messages") and client._in_messages:
-            m = client._in_messages.pop(0)
-            return m
-
-        return None
-
-    except Exception:
-        return None
-
-
-# -------------------------------------------------------
-# MAIN LOGIC (RUNS EACH STREAMLIT REFRESH)
-# -------------------------------------------------------
-msg = poll_mqtt_message()
-
-if msg:
-    try:
-        payload = msg.payload.decode()
-        data = json.loads(payload)
-        temp = float(data["temp"])
-        hum  = float(data["hum"])
-        ts   = datetime.utcnow().isoformat()
-
-        # ML PREDICTION
-        pred = model.predict([[temp, hum]])[0]
-
-        row = {"ts": ts, "temp": temp, "hum": hum, "pred": pred}
-        st.session_state.logs.append(row)
-        st.session_state.last = row
-
-        # Send back output
-        if pred == "Panas":
-            client.publish(TOPIC_OUTPUT, "ALERT_ON")
+    def on_connect(c, userdata, flags, rc):
+        if rc == 0:
+            st.session_state.connected = True
+            c.subscribe(TOPIC_SENSOR)
         else:
-            client.publish(TOPIC_OUTPUT, "ALERT_OFF")
+            st.session_state.connected = False
 
-    except:
-        pass
+    def on_message(c, userdata, msg):
+        try:
+            payload = json.loads(msg.payload.decode())
+            temp = float(payload["temp"])
+            hum = float(payload["hum"])
+        except:
+            return
+
+        X = [[temp, hum]]
+        pred = model.predict(X)[0]
+
+        row = {
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "temp": temp,
+            "hum": hum,
+            "pred": pred
+        }
+
+        st.session_state.last_data = row
+        st.session_state.logs.append(row)
+
+        # auto-response to ESP32
+        if pred == "Panas":
+            c.publish(TOPIC_OUTPUT, "ALERT_ON")
+        else:
+            c.publish(TOPIC_OUTPUT, "ALERT_OFF")
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    client.connect(MQTT_BROKER, MQTT_PORT, keepalive=30)
+    client.loop_start()
+    return client
 
 
-# -------------------------------------------------------
+# create client once
+if st.session_state.mqtt_client is None:
+    st.session_state.mqtt_client = create_client()
+
+
+# -------------------------------------------------------------------
 # UI
-# -------------------------------------------------------
-st.title("🔥 IoT ML Realtime Dashboard (Polling-Safe Version)")
+# -------------------------------------------------------------------
+st.title("🔥 IoT ML Realtime Dashboard (Stable Version)")
 
 left, right = st.columns([1, 2])
 
 with left:
-    st.subheader("Connection")
-    st.metric("Broker", BROKER)
-    st.metric("MQTT Connected", "Yes")
+    st.subheader("MQTT Status")
+    st.metric("Connected", "Yes" if st.session_state.connected else "No")
+    st.metric("Broker", MQTT_BROKER)
 
     st.subheader("Last Data")
-    if st.session_state.last:
-        st.json(st.session_state.last)
+    if st.session_state.last_data:
+        st.write(st.session_state.last_data)
     else:
         st.info("Waiting for data...")
 
-    if st.button("Save Logs CSV"):
+    # Manual override
+    st.subheader("Manual Override")
+    if st.button("Force ALERT ON"):
+        st.session_state.mqtt_client.publish(TOPIC_OUTPUT, "ALERT_ON")
+        st.success("Sent ALERT_ON")
+
+    if st.button("Force ALERT OFF"):
+        st.session_state.mqtt_client.publish(TOPIC_OUTPUT, "ALERT_OFF")
+        st.success("Sent ALERT_OFF")
+
+    if st.button("Save CSV"):
         df = pd.DataFrame(st.session_state.logs)
-        st.download_button("Download", df.to_csv(index=False), "iot_log.csv")
+        st.download_button("Download CSV", df.to_csv(index=False), "iot_log.csv")
 
 with right:
     st.subheader("Live Chart")
+
     df = pd.DataFrame(st.session_state.logs)
+
     if not df.empty:
+        df_tail = df.tail(200)
+
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df["ts"], y=df["temp"], mode="lines+markers", name="Temp"))
-        fig.add_trace(go.Scatter(x=df["ts"], y=df["hum"], mode="lines+markers", name="Humidity"))
+        fig.add_trace(go.Scatter(x=df_tail["ts"], y=df_tail["temp"], mode="lines+markers", name="Temp"))
+        fig.add_trace(go.Scatter(x=df_tail["ts"], y=df_tail["hum"], mode="lines+markers", name="Humidity"))
+
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No data yet")
+        st.info("Waiting for sensor data...")
 
-st.caption("Auto-refresh setiap rerun Streamlit.")
+
+# -------------------------------------------------------------------
+# AUTO REFRESH EVERY 1 SECOND
+# -------------------------------------------------------------------
 time.sleep(1)
 st.experimental_rerun()
