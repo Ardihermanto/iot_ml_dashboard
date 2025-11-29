@@ -1,161 +1,129 @@
-# -------------------------------------------------------
-# STREAMLIT MQTT + ML DASHBOARD (NO THREAD, NO ASYNCIO)
-# -------------------------------------------------------
 import streamlit as st
-st.set_page_config(page_title="IoT ML Dashboard", layout="wide")
+st.set_page_config(page_title="IoT ML Realtime Dashboard", layout="wide")
 
-import time
-import json
-import joblib
 import pandas as pd
 import numpy as np
+import joblib
+import json
+import time
 from datetime import datetime
 import plotly.graph_objs as go
-from paho.mqtt import client as mqtt
+import paho.mqtt.client as mqtt
 
-# -------------------------------------------------------
-# CONFIG (edit as needed)
-# -------------------------------------------------------
-BROKER = st.secrets.get("MQTT_BROKER", "broker.emqx.io")
-PORT   = int(st.secrets.get("MQTT_PORT", 1883))
+# ================================
+# CONFIG
+# ================================
+MQTT_BROKER = st.secrets.get("MQTT_BROKER", "broker.emqx.io")
+MQTT_PORT   = int(st.secrets.get("MQTT_PORT", 1883))
 TOPIC_SENSOR = st.secrets.get("TOPIC_SENSOR", "iot/class/session5/sensor")
 TOPIC_OUTPUT = st.secrets.get("TOPIC_OUTPUT", "iot/class/session5/output")
-MODEL_PATH   = st.secrets.get("MODEL_PATH", "iot_temp_model.pkl")
+MODEL_PATH = st.secrets.get("MODEL_PATH", "iot_temp_model.pkl")
 
-# -------------------------------------------------------
-# INIT SESSION STATE
-# -------------------------------------------------------
+# ================================
+# SESSION STATE
+# ================================
 if "logs" not in st.session_state:
     st.session_state.logs = []
 
-if "last" not in st.session_state:
-    st.session_state.last = None
+if "last_data" not in st.session_state:
+    st.session_state.last_data = None
 
-if "mqtt" not in st.session_state:
-    st.session_state.mqtt = None
+if "mqtt_connected" not in st.session_state:
+    st.session_state.mqtt_connected = False
 
-if "connected" not in st.session_state:
-    st.session_state.connected = False
-
-# -------------------------------------------------------
+# ================================
 # LOAD MODEL
-# -------------------------------------------------------
+# ================================
 @st.cache_resource
-def load_model(path):
+def load_model():
+    return joblib.load(MODEL_PATH)
+
+model = load_model()
+
+# ================================
+# MQTT CALLBACKS
+# Thread-safe → NO UI TOUCH HERE
+# ================================
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        st.session_state.mqtt_connected = True
+        client.subscribe(TOPIC_SENSOR)
+        print("MQTT Connected → subscribed")
+    else:
+        st.session_state.mqtt_connected = False
+        print("MQTT failed:", rc)
+
+def on_message(client, userdata, msg):
     try:
-        return joblib.load(path)
-    except Exception as e:
-        st.error(f"Model load error: {e}")
-        return None
-
-model = load_model(MODEL_PATH)
-
-# -------------------------------------------------------
-# MQTT CONNECT (ONCE)
-# -------------------------------------------------------
-if st.session_state.mqtt is None:
-    def on_connect(client, userdata, flags, rc):
-        st.session_state.connected = (rc == 0)
-        if rc == 0:
-            client.subscribe(TOPIC_SENSOR)
-
-    st.session_state.mqtt = mqtt.Client(protocol=mqtt.MQTTv5)
-    st.session_state.mqtt.on_connect = on_connect
-    st.session_state.mqtt.connect(BROKER, PORT, keepalive=30)
-    st.session_state.mqtt.loop_start()
-    time.sleep(1)
-
-# -------------------------------------------------------
-# READ ONE MESSAGE (NON-BLOCKING)
-# -------------------------------------------------------
-def poll_message():
-    msg = st.session_state.mqtt._sock_recv()
-    if not msg:
-        return None
-
-    # Paho MQTT v5 internal parser:
-    try:
-        packet = st.session_state.mqtt._packet_read(msg)
-        if packet is None or not hasattr(packet, "topic"):
-            return None
-
-        payload = packet.payload.decode()
-        return {
-            "topic": packet.topic,
-            "payload": payload
-        }
+        data = json.loads(msg.payload.decode())
+        temp = float(data["temp"])
+        hum = float(data["hum"])
     except:
-        return None
+        return
 
-# -------------------------------------------------------
-# UI TITLE
-# -------------------------------------------------------
-st.title("IoT ML Realtime Dashboard (Stable)")
+    # prediction
+    pred = model.predict([[temp, hum]])[0]
 
-col1, col2 = st.columns([1,2])
+    # append log
+    row = {
+        "ts": datetime.now().strftime("%H:%M:%S"),
+        "temp": temp,
+        "hum": hum,
+        "pred": pred
+    }
+    st.session_state.logs.append(row)
+    st.session_state.last_data = row
+
+    # send auto alert
+    if pred == "Panas":
+        client.publish(TOPIC_OUTPUT, "ALERT_ON")
+    else:
+        client.publish(TOPIC_OUTPUT, "ALERT_OFF")
+
+# ================================
+# MQTT CLIENT (NO THREAD UI ISSUE)
+# loop_start() is SAFE
+# ================================
+def init_mqtt():
+    client = mqtt.Client()
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    client.loop_start()          # <<< PENTING → STABIL
+    return client
+
+if "mqtt_client" not in st.session_state:
+    st.session_state.mqtt_client = init_mqtt()
+
+# ================================
+# UI DASHBOARD
+# ================================
+st.title("🔥 IoT ML Realtime Dashboard")
+
+col1, col2 = st.columns(2)
 
 with col1:
-    st.subheader("Status")
-    st.metric("Connected", "Yes" if st.session_state.connected else "No")
-    st.metric("Broker", BROKER)
+    st.subheader("MQTT Status")
+    st.metric("Connected", "Yes" if st.session_state.mqtt_connected else "No")
 
-    if st.session_state.last:
-        st.subheader("Last Data")
-        st.write(pd.DataFrame([st.session_state.last]).T)
+    st.subheader("Last Data")
+    if st.session_state.last_data:
+        st.write(st.session_state.last_data)
     else:
-        st.info("Waiting for data...")
-
-    # Save log
-    if st.button("Save Log"):
-        df = pd.DataFrame(st.session_state.logs)
-        st.download_button("Download CSV", df.to_csv(index=False), "log.csv")
+        st.info("Waiting for realtime data...")
 
 with col2:
-    st.subheader("Live Chart")
+    st.subheader("Realtime Chart")
+
     df = pd.DataFrame(st.session_state.logs)
     if not df.empty:
-        df_plot = df.tail(200)
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df_plot["ts"], y=df_plot["temp"], mode="lines+markers", name="Temp"))
-        fig.add_trace(go.Scatter(x=df_plot["ts"], y=df_plot["hum"], mode="lines+markers", name="Hum"))
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["temp"], mode="lines+markers", name="Temp"))
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["hum"], mode="lines+markers", name="Humidity"))
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No chart data yet")
+        st.info("No data yet.")
 
-# -------------------------------------------------------
-# REALTIME LOOP SECTION
-# -------------------------------------------------------
-st.subheader("Realtime Listener")
-
-placeholder = st.empty()
-
-# Run loop safely in Streamlit (auto-rerun)
-for _ in range(15):  # 15 polls (≈15 seconds)
-    msg = poll_message()
-
-    if msg and TOPIC_SENSOR in msg["topic"]:
-        try:
-            data = json.loads(msg["payload"])
-            temp = float(data["temp"])
-            hum  = float(data["hum"])
-            ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            # ML inference
-            pred = model.predict([[temp, hum]])[0]
-
-            row = {"ts": ts, "temp": temp, "hum": hum, "pred": pred}
-            st.session_state.logs.append(row)
-            st.session_state.last = row
-
-            # publish output
-            out = "ALERT_ON" if pred == "Panas" else "ALERT_OFF"
-            st.session_state.mqtt.publish(TOPIC_OUTPUT, out)
-
-            placeholder.write(f"New data: {row}")
-
-        except:
-            pass
-
-    time.sleep(1)
-
-st.experimental_rerun()
+st.subheader("Log Data (Last 20)")
+if not df.empty:
+    st.dataframe(df.tail(20))
