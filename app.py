@@ -1,185 +1,145 @@
-# app.py
+# app.py (FINAL stable, no-thread, safe for Streamlit Cloud)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
 import json
-import queue
-import time
 from datetime import datetime
 import paho.mqtt.client as mqtt
 import plotly.graph_objs as go
+from collections import deque
+from streamlit_autorefresh import st_autorefresh
 
-# -------------------------
-# Page config
-# -------------------------
-st.set_page_config(page_title="IoT ML Dashboard (Queue MQTT)", layout="wide")
-st.title("IoT ML Realtime Dashboard — Queue-based MQTT")
+# -------- Page config ----------
+st.set_page_config(page_title="IoT ML Realtime Dashboard", layout="wide")
+st.title("IoT ML Realtime Dashboard — Stable Final")
 
-# -------------------------
-# Config (use Streamlit secrets or defaults)
-# -------------------------
+# -------- Config from secrets ----------
 MQTT_BROKER = st.secrets.get("MQTT_BROKER", "broker.hivemq.com")
 MQTT_PORT   = int(st.secrets.get("MQTT_PORT", 1883))
 TOPIC_SENSOR = st.secrets.get("TOPIC_SENSOR", "iot/class/session5/sensor")
 TOPIC_OUTPUT = st.secrets.get("TOPIC_OUTPUT", "iot/class/session5/output")
 MODEL_PATH = st.secrets.get("MODEL_PATH", "iot_temp_model.pkl")
 
-# -------------------------
-# Session state init
-# -------------------------
-if "logs" not in st.session_state:
-    st.session_state.logs = []
-if "last" not in st.session_state:
-    st.session_state.last = None
+# -------- Session state init ----------
+if "mqtt_client" not in st.session_state:
+    st.session_state.mqtt_client = None
 if "mqtt_connected" not in st.session_state:
     st.session_state.mqtt_connected = False
+if "logs" not in st.session_state:
+    st.session_state.logs = []       # list of dict rows
+if "incoming" not in st.session_state:
+    st.session_state.incoming = deque(maxlen=1000)  # messages pushed by callback
+if "last" not in st.session_state:
+    st.session_state.last = None
 if "override" not in st.session_state:
     st.session_state.override = None
 
-# -------------------------
-# Thread-safe queue shared between MQTT callback (thread) and main Streamlit (main thread)
-# -------------------------
-if "mqtt_queue" not in st.session_state:
-    st.session_state.mqtt_queue = queue.Queue()
-
-# -------------------------
-# Load model safely (cached)
-# -------------------------
+# -------- Load model (cached) ----------
 @st.cache_resource
 def load_model(path):
     try:
-        return joblib.load(path)
+        m = joblib.load(path)
+        return m
     except Exception as e:
         st.error(f"Failed to load model: {e}")
         return None
 
 model = load_model(MODEL_PATH)
 
-# -------------------------
-# MQTT callbacks (must NOT call Streamlit API here)
-# only put parsed messages into st.session_state.mqtt_queue
-# -------------------------
+# -------- MQTT callbacks (safe) ----------
 def _on_connect(client, userdata, flags, rc):
-    # rc = 0 -> success
-    # Do NOT call st.* here
+    # This callback will be executed SYNCHRONOUSLY inside client.loop(...) calls.
+    st.session_state.mqtt_connected = (rc == 0)
     if rc == 0:
         client.subscribe(TOPIC_SENSOR)
-        # put a simple status message to queue
-        st.session_state.mqtt_queue.put({"_type": "status", "connected": True})
-    else:
-        st.session_state.mqtt_queue.put({"_type": "status", "connected": False, "rc": rc})
 
 def _on_message(client, userdata, msg):
+    # The payload is put into session_state.incoming (deque).
+    # Callback runs inside the same thread when we call client.loop(timeout=...).
     try:
         payload = msg.payload.decode()
-        j = json.loads(payload)
-        temp = float(j.get("temp"))
-        hum = float(j.get("hum"))
+        data = json.loads(payload)
     except Exception:
-        # ignore bad payload
         return
+    st.session_state.incoming.append(data)
 
-    ts = datetime.utcnow().isoformat()
-    # place raw sensor data into queue
-    st.session_state.mqtt_queue.put({
-        "_type": "sensor",
-        "ts": ts,
-        "temp": temp,
-        "hum": hum
-    })
-
-# -------------------------
-# Setup MQTT client once (will start loop_start thread)
-# -------------------------
-if "mqtt_client" not in st.session_state:
+# -------- Create & connect client (once) ----------
+if st.session_state.mqtt_client is None:
     client = mqtt.Client()
     client.on_connect = _on_connect
     client.on_message = _on_message
     try:
-        client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-        client.loop_start()  # starts background thread managed by paho
+        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        # DO NOT call loop_start() — we will call loop(...) manually below
         st.session_state.mqtt_client = client
-        # put initial status attempt
-        st.session_state.mqtt_queue.put({"_type": "status", "connected": None})
     except Exception as e:
-        st.error(f"Failed to connect to MQTT broker: {e}")
+        st.error(f"Cannot connect to MQTT broker: {e}")
         st.session_state.mqtt_client = None
-        st.session_state.mqtt_queue.put({"_type": "status", "connected": False, "error": str(e)})
+        st.session_state.mqtt_connected = False
 
-# -------------------------
-# Poll the queue and update session_state (main Streamlit thread)
-# -------------------------
-def drain_mqtt_queue():
-    q = st.session_state.mqtt_queue
-    updated = False
-    while not q.empty():
-        item = q.get()
-        if not isinstance(item, dict):
-            continue
-        t = item.get("_type")
-        if t == "status":
-            connected = item.get("connected")
-            if connected is not None:
-                st.session_state.mqtt_connected = bool(connected)
-            updated = True
-        elif t == "sensor":
-            ts = item["ts"]
-            temp = item["temp"]
-            hum = item["hum"]
-            # do ML prediction here in main thread (safe)
-            pred = "N/A"
-            conf = None
-            if model is not None:
-                try:
-                    X = [[temp, hum]]
-                    pred = model.predict(X)[0]
-                    try:
-                        conf = float(np.max(model.predict_proba(X)))
-                    except Exception:
-                        conf = None
-                except Exception:
-                    pred = "ERR"
-            row = {"ts": ts, "temp": temp, "hum": hum, "pred": pred, "conf": conf}
-            st.session_state.logs.append(row)
-            st.session_state.last = row
-            # Auto-send output to ESP32 unless override active
-            if st.session_state.override is None and st.session_state.mqtt_client:
-                try:
-                    if pred == "Panas":
-                        st.session_state.mqtt_client.publish(TOPIC_OUTPUT, "ALERT_ON")
-                    else:
-                        st.session_state.mqtt_client.publish(TOPIC_OUTPUT, "ALERT_OFF")
-                except Exception:
-                    pass
-            updated = True
-    return updated
+# -------- Polling / autoreload ----------
+# Use st_autorefresh to rerun the script every 1 second (1000 ms)
+# so we call client.loop(timeout=...) each run and process incoming messages
+st_autorefresh(interval=1000, key="autorefresh")  # rerun every 1s
 
-# call drain at top of app run (every rerun)
-drain_mqtt_queue()
+# -------- On each rerun: process network events and incoming queue ----------
+client = st.session_state.mqtt_client
+if client is not None:
+    try:
+        # process network events (non-blocking, runs callbacks in this thread)
+        client.loop(timeout=0.1)  # short single iteration
+    except Exception:
+        st.session_state.mqtt_connected = False
 
-# -------------------------
-# UI
-# -------------------------
+# Process items collected by callback (incoming deque)
+while st.session_state.incoming:
+    msg = st.session_state.incoming.popleft()
+    # Expected format: {"temp": 29.5, "hum": 70.1}
+    try:
+        temp = float(msg.get("temp"))
+        hum = float(msg.get("hum"))
+    except Exception:
+        continue
+
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Predict (safe)
+    pred = "N/A"
+    conf = None
+    if model is not None:
+        try:
+            pred = model.predict([[temp, hum]])[0]
+            # optional confidence
+            try:
+                conf = float(np.max(model.predict_proba([[temp, hum]])))
+            except Exception:
+                conf = None
+        except Exception:
+            pred = "ERR"
+
+    row = {"ts": ts, "temp": temp, "hum": hum, "pred": pred, "conf": conf}
+    st.session_state.logs.append(row)
+    st.session_state.last = row
+
+    # Send output to ESP32 unless override set
+    if client is not None and st.session_state.override is None:
+        try:
+            if pred == "Panas":
+                client.publish(TOPIC_OUTPUT, "ALERT_ON")
+            else:
+                client.publish(TOPIC_OUTPUT, "ALERT_OFF")
+        except Exception:
+            pass
+
+# -------- UI ----------
 left, right = st.columns([1, 2])
 
 with left:
     st.subheader("Connection")
-    st.metric("Broker", MQTT_BROKER)
-    st.metric("MQTT Connected", "Yes" if st.session_state.mqtt_connected else "No")
-
-    st.subheader("Manual Override")
-    c1, c2 = st.columns(2)
-    if c1.button("Force ALERT ON"):
-        st.session_state.override = "ON"
-        if st.session_state.mqtt_client:
-            st.session_state.mqtt_client.publish(TOPIC_OUTPUT, "ALERT_ON")
-    if c2.button("Force ALERT OFF"):
-        st.session_state.override = "OFF"
-        if st.session_state.mqtt_client:
-            st.session_state.mqtt_client.publish(TOPIC_OUTPUT, "ALERT_OFF")
-    if st.button("Clear Override"):
-        st.session_state.override = None
+    st.metric("MQTT Broker", MQTT_BROKER)
+    st.metric("Connected", "Yes" if st.session_state.mqtt_connected else "No")
+    st.metric("Messages", len(st.session_state.logs))
 
     st.subheader("Last Reading")
     if st.session_state.last:
@@ -187,40 +147,54 @@ with left:
     else:
         st.info("Waiting for data...")
 
-    if st.button("Save log CSV"):
+    st.subheader("Manual Override")
+    col1, col2 = st.columns(2)
+    if col1.button("Force ALERT ON"):
+        st.session_state.override = "ON"
+        if client:
+            client.publish(TOPIC_OUTPUT, "ALERT_ON")
+            st.success("ALERT_ON published")
+    if col2.button("Force ALERT OFF"):
+        st.session_state.override = "OFF"
+        if client:
+            client.publish(TOPIC_OUTPUT, "ALERT_OFF")
+            st.success("ALERT_OFF published")
+    if st.button("Clear override"):
+        st.session_state.override = None
+        st.info("Auto alerts resumed")
+
+    if st.button("Download logs CSV"):
         if st.session_state.logs:
-            df = pd.DataFrame(st.session_state.logs)
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download CSV", csv, file_name="iot_log.csv")
+            dfdl = pd.DataFrame(st.session_state.logs)
+            csv = dfdl.to_csv(index=False).encode("utf-8")
+            st.download_button("Download CSV", csv, file_name="iot_logs.csv", mime="text/csv")
         else:
             st.warning("No logs yet")
 
 with right:
-    st.subheader("Live chart")
-    df = pd.DataFrame(st.session_state.logs)
-    if not df.empty:
-        df_plot = df.tail(200)
+    st.subheader("Live Chart (last 200)")
+    if st.session_state.logs:
+        df = pd.DataFrame(st.session_state.logs).tail(200)
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df_plot["ts"], y=df_plot["temp"], mode="lines+markers", name="temp"))
-        fig.add_trace(go.Scatter(x=df_plot["ts"], y=df_plot["hum"], mode="lines+markers", name="hum"))
-        # color markers by pred if present
-        if "pred" in df_plot.columns:
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["temp"], mode="lines+markers", name="Temperature (°C)"))
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["hum"], mode="lines+markers", name="Humidity (%)"))
+        # color markers by prediction
+        if "pred" in df.columns:
             colors = []
-            for p in df_plot["pred"]:
-                if p == "Panas": colors.append("red")
-                elif p == "Normal": colors.append("green")
-                else: colors.append("blue")
+            for p in df["pred"]:
+                if p == "Panas":
+                    colors.append("red")
+                elif p == "Normal":
+                    colors.append("green")
+                else:
+                    colors.append("blue")
             fig.update_traces(marker=dict(color=colors), selector=dict(mode="markers"))
-        fig.update_layout(height=450, xaxis_title="timestamp")
+        fig.update_layout(xaxis_title="timestamp", height=480)
         st.plotly_chart(fig, use_container_width=True)
-        st.subheader("Recent logs")
+        st.subheader("Recent Logs")
         st.dataframe(df.iloc[::-1].head(20))
     else:
-        st.info("No data yet")
+        st.info("No incoming data yet")
 
 st.markdown("---")
-st.write("Manual override:", st.session_state.override)
-st.write("Total messages:", len(st.session_state.logs))
-
-# keep UI responsive: optional small sleep (not required)
-time.sleep(0.1)
+st.caption("Notes: Streamlit polls MQTT once per rerun; st_autorefresh triggers reruns every 1s.")
